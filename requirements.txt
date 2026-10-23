@@ -1,4 +1,6 @@
 numpy>=1.24
-torch>=2.0
 matplotlib>=3.7
 pytest>=7.0
+
+# Install PyTorch separately in the active Conda environment. Use the CUDA
+# wheel/Conda command appropriate for your driver: https://pytorch.org/get-started/locally/

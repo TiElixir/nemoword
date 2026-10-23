@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import random
-import sys
+import time
 
 import numpy as np
 
@@ -17,7 +17,7 @@ from wordle.solver import entropy_score, load_word_list
 
 def generate_dataset(
     answers: list[str], allowed: list[str], *, states: int = 20_000,
-    seed: int = 0, teacher: str = "entropy",
+    seed: int = 0, teacher: str = "entropy", progress_every: int = 500,
 ) -> dict[str, np.ndarray]:
     """Generate diverse states, grouping every state by its hidden answer."""
     if states < 1:
@@ -29,7 +29,8 @@ def generate_dataset(
     # The caller passes a training-only answer subset; hidden answer is used
     # only to produce simulator transitions, never to form input features.
     samples: list[tuple[list[float], float, str]] = []
-    for _ in range(states):
+    started = time.perf_counter()
+    for state_index in range(states):
         answer = rng.choice(answers)
         game = WordleGame(answer, answers, allowed)
         # Construct a legal history using entropy teacher decisions. Include
@@ -42,22 +43,26 @@ def generate_dataset(
                 break
         if game.finished:
             game = WordleGame(answer, answers, allowed)
-        # Evaluating every official legal word at every state is needlessly
-        # expensive. Score answer actions plus a seeded sample of legal probes.
-        actions = set(game.candidates)
-        actions.update(rng.sample(allowed, min(32, len(allowed))))
-        ranked = sorted(actions, key=lambda g: (-_score(g, game.candidates, teacher), g))
-        chosen = ranked[: min(12, len(ranked))]
-        remaining = [action for action in ranked[12:] if action not in chosen]
-        if remaining:
-            chosen.extend(rng.sample(remaining, min(8, len(remaining))))
-        best = max((_score(action, game.candidates, teacher) for action in chosen), default=1.0)
-        for action in chosen:
-            score = _score(action, game.candidates, teacher)
+        # Estimate teacher scores on bounded candidate samples; exact entropy
+        # over thousands of candidates dominates generation's CPU runtime.
+        score_candidates = (rng.sample(game.candidates, min(128, len(game.candidates)))
+                            if len(game.candidates) > 128 else game.candidates)
+        candidate_actions = rng.sample(game.candidates, min(8, len(game.candidates)))
+        actions = set(candidate_actions)
+        actions.update(rng.sample(allowed, min(8, len(allowed))))
+        scored = sorted(((action, _score(action, score_candidates, teacher)) for action in actions),
+                        key=lambda pair: (-pair[1], pair[0]))
+        chosen = scored[:min(8, len(scored))]
+        best = max((score for _, score in chosen), default=1.0)
+        for action, score in chosen:
             # Regression target normalized within this observable state.
             target = score / max(abs(best), 1e-9)
             samples.append((encode_state_action(game.history, game.candidates, action,
                 total_answers=len(answers)), target, answer))
+        if progress_every > 0 and (state_index + 1) % progress_every == 0:
+            elapsed = time.perf_counter() - started
+            print(f"Generated states: {state_index + 1}/{states}; "
+                  f"examples: {len(samples)}; elapsed: {elapsed:.1f}s", flush=True)
     return {
         "features": np.asarray([row[0] for row in samples], dtype=np.float32),
         "targets": np.asarray([row[1] for row in samples], dtype=np.float32),
@@ -77,11 +82,12 @@ def _score(action: str, candidates: list[str], teacher: str) -> float:
 
 
 def _teacher_action(candidates: list[str], allowed: list[str], rng: random.Random) -> str:
-    # Bounded action subset keeps 20k-state generation practical on CPU.
+    # Sample candidate outcomes and actions to bound teacher simulation.
     from wordle.solver import entropy_guess
-    actions = set(candidates)
-    actions.update(rng.sample(allowed, min(32, len(allowed))))
-    return entropy_guess(candidates, sorted(actions))
+    outcomes = rng.sample(candidates, min(128, len(candidates)))
+    actions = set(rng.sample(candidates, min(8, len(candidates))))
+    actions.update(rng.sample(allowed, min(8, len(allowed))))
+    return entropy_guess(outcomes, sorted(actions))
 
 
 def main() -> None:
@@ -94,6 +100,7 @@ def main() -> None:
     parser.add_argument("--teacher", choices=["entropy", "expected_remaining"], default="entropy")
     parser.add_argument("--eval-answers", default="", help="existing held-out answer list; omitted means create a deterministic 20%% holdout")
     parser.add_argument("--eval-output", default="data/eval_answers.txt", help="where the automatic held-out list is written")
+    parser.add_argument("--progress-every", type=int, default=500, help="print CPU generation progress every N states; 0 disables")
     args = parser.parse_args()
     answers = load_word_list(args.answers, name="official answer list")
     allowed = load_word_list(args.allowed, name="allowed guess list")
@@ -102,6 +109,8 @@ def main() -> None:
             heldout = set(load_word_list(args.eval_answers, name="evaluation answer list"))
         except FileNotFoundError as error:
             parser.error(f"{error}. Omit --eval-answers to create a deterministic held-out subset automatically.")
+        except ValueError as error:
+            parser.error(f"{error}. Ensure the evaluation file contains one five-letter word per line.")
         answers = [word for word in answers if word not in heldout]
         if not answers:
             parser.error("all training answers overlap held-out evaluation answers")
@@ -118,7 +127,9 @@ def main() -> None:
         eval_path = Path(args.eval_output)
         eval_path.parent.mkdir(parents=True, exist_ok=True)
         eval_path.write_text("\n".join(eval_answers) + "\n", encoding="utf-8")
-    dataset = generate_dataset(answers, allowed, states=args.states, seed=args.seed, teacher=args.teacher)
+    print(f"Generating {args.states} teacher states on CPU; CUDA accelerates model training, not this Python simulation.", flush=True)
+    dataset = generate_dataset(answers, allowed, states=args.states, seed=args.seed,
+                               teacher=args.teacher, progress_every=args.progress_every)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **dataset)

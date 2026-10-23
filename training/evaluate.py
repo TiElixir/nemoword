@@ -7,12 +7,10 @@ import csv
 import json
 from pathlib import Path
 import random
+import sys
 import time
 from typing import Callable
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -23,14 +21,15 @@ from training.train import load_scorer
 
 
 def evaluate(answers: list[str], allowed: list[str], *, seed: int = 0,
-             model_path: str = "", sample_count: int = 0, device: str = "cpu") -> dict:
+             model_path: str = "", sample_count: int = 0, device: str = "auto",
+             progress_every: int = 100) -> dict:
     """Compare all policies on the same reproducibly sampled held-out answers."""
     selected = sample_answers(answers, sample_count, seed) if sample_count else list(answers)
     model = load_scorer(model_path, device) if model_path else None
     rng = random.Random(seed)
     rows=[]
     policies = ["random", "frequency", "entropy"] + (["ml"] if model else [])
-    for answer in selected:
+    for answer_index, answer in enumerate(selected):
         for policy in policies:
             game = WordleGame(answer, answers, allowed)
             start = time.perf_counter()
@@ -47,6 +46,8 @@ def evaluate(answers: list[str], allowed: list[str], *, seed: int = 0,
             latency = (time.perf_counter() - start) / max(len(game.history), 1)
             rows.append({"strategy": policy, "answer": answer, "solved": game.solved,
                 "guesses": len(game.history), "first_guess": game.history[0][0], "latency_seconds_per_guess": latency})
+        if progress_every > 0 and (answer_index + 1) % progress_every == 0:
+            print(f"Evaluated answers: {answer_index + 1}/{len(selected)}", file=sys.stderr, flush=True)
     metrics={}
     for policy in policies:
         subset=[row for row in rows if row["strategy"] == policy]
@@ -74,6 +75,10 @@ def _model_guess(model, game: WordleGame, allowed: list[str], total: int, device
 
 def write_results(result: dict, output_dir: str) -> None:
     """Write complete JSON/CSV reports and strategy/distribution plots."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     out=Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     (out/"evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     with (out/"games.csv").open("w", newline="", encoding="utf-8") as file:
@@ -93,10 +98,14 @@ def main() -> None:
     parser.add_argument("--answers", default="data/answers.txt"); parser.add_argument("--allowed", default="data/allowed_guesses.txt")
     parser.add_argument("--model", default=""); parser.add_argument("--output-dir", default="results")
     parser.add_argument("--seed", type=int, default=0); parser.add_argument("--sample-count", type=int, default=0)
-    parser.add_argument("--device", default="cpu"); args=parser.parse_args()
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--progress-every", type=int, default=100)
+    args=parser.parse_args()
     answers=load_word_list(args.answers, name="held-out evaluation answer list")
     allowed=load_word_list(args.allowed, name="allowed guess list")
-    result=evaluate(answers, allowed, seed=args.seed, model_path=args.model, sample_count=args.sample_count, device=args.device)
+    result=evaluate(answers, allowed, seed=args.seed, model_path=args.model,
+                    sample_count=args.sample_count, device=args.device,
+                    progress_every=args.progress_every)
     write_results(result, args.output_dir)
     print(json.dumps(result["metrics"], indent=2))
 

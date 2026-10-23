@@ -7,9 +7,6 @@ import json
 from pathlib import Path
 import random
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn
@@ -28,13 +25,37 @@ class GuessScorer(nn.Module):
         return self.layers(features).squeeze(-1)
 
 
+def resolve_device(requested: str = "auto") -> torch.device:
+    """Resolve auto/CPU/CUDA and fail clearly for unavailable CUDA requests."""
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        device = torch.device(requested)
+    except (RuntimeError, ValueError) as error:
+        raise ValueError(f"invalid device {requested!r}; use auto, cpu, or cuda") from error
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested but PyTorch cannot access it. Install a CUDA-enabled "
+            "PyTorch build in the active Conda environment and verify with "
+            "python -c \"import torch; print(torch.cuda.is_available())\"."
+        )
+    return device
+
+
 def train(dataset_path: str, output_dir: str, *, epochs: int = 30, batch_size: int = 512,
           learning_rate: float = 1e-3, seed: int = 0, device: str = "auto") -> Path:
     """Train with a hidden-answer split, saving best validation checkpoint."""
+    resolved_device = resolve_device(device)
+    dataset_file = Path(dataset_path)
+    if not dataset_file.is_file():
+        raise FileNotFoundError(
+            f"Training dataset not found: {dataset_file}. Generate it first with "
+            "python -m training.generate_data --states 20000 --seed 17 --teacher entropy"
+        )
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    data = np.load(dataset_path)
+    data = np.load(dataset_file)
     x, y, answer_ids = data["features"], data["targets"], data["answer_ids"]
     unique_answers = sorted(set(answer_ids.tolist()))
     rng = np.random.default_rng(seed)
@@ -46,9 +67,11 @@ def train(dataset_path: str, output_dir: str, *, epochs: int = 30, batch_size: i
         raise ValueError("need at least two distinct hidden answers for answer-level validation")
     train_mask = np.isin(answer_ids, list(training_answers))
     val_mask = np.isin(answer_ids, list(validation_answers))
-    resolved_device = torch.device("cuda" if device == "auto" and torch.cuda.is_available()
-                                   else "cpu" if device == "auto" else device)
     model = GuessScorer(x.shape[1]).to(resolved_device)
+    device_label = (torch.cuda.get_device_name(resolved_device) if resolved_device.type == "cuda"
+                    else "CPU")
+    print(f"Training on {resolved_device} ({device_label}); samples={len(x)}, "
+          f"train={int(train_mask.sum())}, validation={int(val_mask.sum())}", flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     loss_fn = nn.MSELoss()
     train_ds = TensorDataset(torch.from_numpy(x[train_mask]), torch.from_numpy(y[train_mask]))
@@ -57,7 +80,7 @@ def train(dataset_path: str, output_dir: str, *, epochs: int = 30, batch_size: i
                         generator=torch.Generator().manual_seed(seed))
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     best_val = float("inf"); train_losses=[]; val_losses=[]
-    for _epoch in range(epochs):
+    for epoch in range(epochs):
         model.train(); running=0.0; count=0
         for xb, yb in loader:
             xb, yb = xb.to(resolved_device), yb.to(resolved_device)
@@ -67,6 +90,8 @@ def train(dataset_path: str, output_dir: str, *, epochs: int = 30, batch_size: i
         with torch.no_grad():
             val_loss = loss_fn(model(val_x), val_y).item()
         train_losses.append(running / max(count, 1)); val_losses.append(val_loss)
+        print(f"Epoch {epoch + 1}/{epochs}: train_mse={train_losses[-1]:.6f} "
+              f"validation_mse={val_loss:.6f}", flush=True)
         if val_loss < best_val:
             best_val = val_loss
             torch.save({"model_state": model.state_dict(), "input_size": x.shape[1],
@@ -77,17 +102,32 @@ def train(dataset_path: str, output_dir: str, *, epochs: int = 30, batch_size: i
                 output / "best_model.pt")
     with (output / "losses.json").open("w", encoding="utf-8") as file:
         json.dump({"train": train_losses, "validation": val_losses}, file, indent=2)
-    plt.plot(train_losses, label="train"); plt.plot(val_losses, label="validation")
-    plt.xlabel("Epoch"); plt.ylabel("MSE loss"); plt.legend(); plt.tight_layout()
-    plt.savefig(output / "loss.png"); plt.close()
+    _save_loss_plot(train_losses, val_losses, output / "loss.png")
     return output / "best_model.pt"
 
 
-def load_scorer(checkpoint: str, device: str = "cpu") -> GuessScorer:
+def _save_loss_plot(train_losses: list[float], val_losses: list[float], path: Path) -> None:
+    """Create training plot lazily so inference only requires PyTorch/NumPy."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.plot(train_losses, label="train")
+    plt.plot(val_losses, label="validation")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def load_scorer(checkpoint: str, device: str = "auto") -> GuessScorer:
     """Load a trained scorer for inference."""
-    state = torch.load(checkpoint, map_location=device, weights_only=False)
+    resolved_device = resolve_device(device)
+    state = torch.load(checkpoint, map_location=resolved_device, weights_only=False)
     model = GuessScorer(state["input_size"], state["hidden_size"])
-    model.load_state_dict(state["model_state"]); model.to(device); model.eval()
+    model.load_state_dict(state["model_state"]); model.to(resolved_device); model.eval()
     return model
 
 
@@ -99,7 +139,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
     print(train(args.dataset, args.output_dir, epochs=args.epochs, batch_size=args.batch_size,
         learning_rate=args.learning_rate, seed=args.seed, device=args.device))
