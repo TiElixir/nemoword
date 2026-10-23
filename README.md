@@ -23,8 +23,14 @@ Generate an initial 20,000-state teacher dataset (an experimental starting
 point, not a guaranteed sufficient sample):
 
 ```sh
-python -m training.generate_data --states 20000 --seed 17 --teacher entropy --eval-answers data/eval_answers.txt
+python -m training.generate_data --states 20000 --seed 17 --teacher entropy
 ```
+
+Without `--eval-answers`, generation deterministically reserves 20% of the
+supplied answers (at least one) as `data/eval_answers.txt` and uses only the
+remaining answers for generated training states. For an existing holdout, pass
+`--eval-answers path/to/heldout.txt`; every entry in it is excluded from
+training. The held-out list must also be used for final evaluation.
 
 The compressed NumPy archive includes state-action features, normalized
 teacher entropy scores, answer-group IDs, and seed/teacher metadata. Splitting

@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import random
+import sys
 
 import numpy as np
 
@@ -23,6 +24,7 @@ def generate_dataset(
         raise ValueError("states must be positive")
     if not answers or not allowed:
         raise ValueError("answer and allowed-guess lists must not be empty")
+    allowed = sorted(set(allowed).union(answers))
     rng = random.Random(seed)
     # The caller passes a training-only answer subset; hidden answer is used
     # only to produce simulator transitions, never to form input features.
@@ -90,21 +92,39 @@ def main() -> None:
     parser.add_argument("--states", type=int, default=20_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--teacher", choices=["entropy", "expected_remaining"], default="entropy")
-    parser.add_argument("--eval-answers", default="", help="optional held-out answer list excluded from training")
+    parser.add_argument("--eval-answers", default="", help="existing held-out answer list; omitted means create a deterministic 20%% holdout")
+    parser.add_argument("--eval-output", default="data/eval_answers.txt", help="where the automatic held-out list is written")
     args = parser.parse_args()
     answers = load_word_list(args.answers, name="official answer list")
     allowed = load_word_list(args.allowed, name="allowed guess list")
     if args.eval_answers:
-        heldout = set(load_word_list(args.eval_answers, name="evaluation answer list"))
+        try:
+            heldout = set(load_word_list(args.eval_answers, name="evaluation answer list"))
+        except FileNotFoundError as error:
+            parser.error(f"{error}. Omit --eval-answers to create a deterministic held-out subset automatically.")
         answers = [word for word in answers if word not in heldout]
         if not answers:
             parser.error("all training answers overlap held-out evaluation answers")
+        eval_answers = sorted(heldout.intersection(load_word_list(args.answers, name="official answer list")))
+    else:
+        if len(answers) < 2:
+            parser.error("at least two answers are required for a held-out split")
+        shuffled = list(answers)
+        random.Random(args.seed).shuffle(shuffled)
+        holdout_count = max(1, round(len(shuffled) * 0.2))
+        eval_answers = sorted(shuffled[:holdout_count])
+        heldout = set(eval_answers)
+        answers = [word for word in answers if word not in heldout]
+        eval_path = Path(args.eval_output)
+        eval_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_path.write_text("\n".join(eval_answers) + "\n", encoding="utf-8")
     dataset = generate_dataset(answers, allowed, states=args.states, seed=args.seed, teacher=args.teacher)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **dataset)
     output.with_suffix(".json").write_text(json.dumps({"states": args.states, "examples": len(dataset["targets"]),
-        "seed": args.seed, "teacher": args.teacher, "training_answers": len(answers)}, indent=2), encoding="utf-8")
+        "seed": args.seed, "teacher": args.teacher, "training_answers": len(answers),
+        "evaluation_answers": len(eval_answers), "evaluation_answer_file": args.eval_answers or args.eval_output}, indent=2), encoding="utf-8")
     print(f"Wrote {len(dataset['targets'])} state-action examples to {output}")
 
 
