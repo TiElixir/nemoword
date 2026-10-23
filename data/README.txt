@@ -1,0 +1,8 @@
+Supply two newline-delimited lowercase five-letter lists:
+
+answers.txt: the possible hidden answers.
+allowed_guesses.txt: all guesses the game permits (usually includes answers).
+
+No word lists are bundled. Obtain lists from a Wordle-compatible source whose
+license permits your intended use, and record its URL, version, and license
+locally. The project does not silently substitute an arbitrary dictionary.
