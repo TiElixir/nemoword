@@ -112,9 +112,7 @@ python -m pytest -q
 
 Tests use small synthetic cases and do not require downloaded word lists. CUDA-specific checks skip if CUDA is unavailable.
 
-## Optional future work: reinforcement learning
 
-Reinforcement learning is not implemented. A future experiment could treat Wordle as a finite-horizon process: the observable state is guess/feedback history and remaining candidates, actions are legal guesses, transitions are deterministic feedback, and rewards favor solving while penalizing extra turns and failure. An action-masked policy-gradient method or fitted-Q approach could be evaluated against this supervised scorer on identical held-out answers. The action vocabulary is large and includes non-answer probe guesses, so action masking, stable word indexing, and careful held-out evaluation would be necessary.
 
 ## License
 
